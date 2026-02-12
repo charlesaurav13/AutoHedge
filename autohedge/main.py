@@ -1,579 +1,557 @@
+import os
 import uuid
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import pandas as pd
+import yfinance as yf
+from dotenv import load_dotenv
 from loguru import logger
 from pydantic import BaseModel
 from swarms import Agent, Conversation
-from tickr_agent.main import TickrAgent
 
-# Director Agent - Manages overall strategy and coordinates other agents
-DIRECTOR_PROMPT = """
-You are a Trading Director AI, responsible for orchestrating the trading process. 
+load_dotenv()
+
+# ── DeepSeek Configuration ──────────────────────────────────────────────
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL = os.getenv("OPENAI_API_BASE", "https://api.deepseek.com")
+
+# Set environment variables so the swarms Agent picks up DeepSeek as an OpenAI-compatible provider
+os.environ["OPENAI_API_KEY"] = DEEPSEEK_API_KEY
+os.environ["OPENAI_API_BASE"] = DEEPSEEK_BASE_URL
+
+# Swarms Agent model string for DeepSeek (OpenAI-compatible)
+AGENT_MODEL = f"deepseek/{DEEPSEEK_MODEL}"
+
+
+# ── Crypto Data Fetcher ─────────────────────────────────────────────────
+CRYPTO_YFINANCE_MAP = {
+    "BTC": "BTC-USD",
+    "BTCUSDT": "BTC-USD",
+    "ETH": "ETH-USD",
+    "ETHUSDT": "ETH-USD",
+    "SOL": "SOL-USD",
+    "SOLUSDT": "SOL-USD",
+    "BNB": "BNB-USD",
+    "XRP": "XRP-USD",
+    "ADA": "ADA-USD",
+    "DOGE": "DOGE-USD",
+    "AVAX": "AVAX-USD",
+    "DOT": "DOT-USD",
+    "MATIC": "MATIC-USD",
+    "LINK": "LINK-USD",
+}
+
+
+def get_yf_ticker(symbol: str) -> str:
+    """Convert a crypto symbol to its yfinance ticker."""
+    sym = symbol.upper().replace("/", "").replace("-", "")
+    if sym in CRYPTO_YFINANCE_MAP:
+        return CRYPTO_YFINANCE_MAP[sym]
+    if "-" in symbol:
+        return symbol
+    return f"{sym}-USD"
+
+
+def fetch_crypto_data(symbol: str) -> Dict:
+    """
+    Fetch comprehensive crypto market data using yfinance.
+    Returns a dict with price, volume, RSI, moving averages, etc.
+    """
+    yf_ticker = get_yf_ticker(symbol)
+    logger.info(f"Fetching crypto data for {symbol} (yfinance: {yf_ticker})")
+
+    try:
+        ticker = yf.Ticker(yf_ticker)
+        info = ticker.info
+
+        history = ticker.history(period="1y")
+        if history.empty:
+            logger.warning(f"No historical data for {yf_ticker}")
+            return {"symbol": symbol, "error": f"No data for {yf_ticker}"}
+
+        current_price = history["Close"].iloc[-1]
+
+        # RSI (14-day)
+        delta = history["Close"].diff()
+        up = delta.clip(lower=0)
+        down = -1 * delta.clip(upper=0)
+        avg_gain = up.rolling(window=14, min_periods=14).mean()
+        avg_loss = down.rolling(window=14, min_periods=14).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        current_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else None
+
+        # Moving averages
+        ma_7 = float(history["Close"].rolling(window=7).mean().iloc[-1])
+        ma_25 = float(history["Close"].rolling(window=25).mean().iloc[-1])
+        ma_50 = float(history["Close"].rolling(window=50).mean().iloc[-1])
+        ma_99 = float(history["Close"].rolling(window=99).mean().iloc[-1])
+        ma_200 = float(history["Close"].rolling(window=200).mean().iloc[-1])
+
+        # Bollinger Bands (20-day)
+        bb_mid = history["Close"].rolling(window=20).mean()
+        bb_std = history["Close"].rolling(window=20).std()
+        bb_upper = float((bb_mid + 2 * bb_std).iloc[-1])
+        bb_lower = float((bb_mid - 2 * bb_std).iloc[-1])
+
+        # MACD
+        ema_12 = history["Close"].ewm(span=12, adjust=False).mean()
+        ema_26 = history["Close"].ewm(span=26, adjust=False).mean()
+        macd_line = ema_12 - ema_26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_histogram = macd_line - signal_line
+
+        # Price changes
+        price_1d = float(history["Close"].pct_change(1).iloc[-1] * 100)
+        price_7d = float(history["Close"].pct_change(7).iloc[-1] * 100) if len(history) > 7 else None
+        price_30d = float(history["Close"].pct_change(30).iloc[-1] * 100) if len(history) > 30 else None
+        price_90d = float(history["Close"].pct_change(90).iloc[-1] * 100) if len(history) > 90 else None
+
+        # Volatility (30-day annualized)
+        daily_returns = history["Close"].pct_change().dropna()
+        volatility_30d = float(daily_returns.tail(30).std() * (365 ** 0.5) * 100)
+
+        # Volume analysis
+        avg_volume_30d = float(history["Volume"].tail(30).mean())
+        current_volume = float(history["Volume"].iloc[-1])
+
+        # ATH / ATL from available data
+        ath = float(history["Close"].max())
+        atl = float(history["Close"].min())
+        pct_from_ath = float((current_price - ath) / ath * 100)
+
+        # Trend determination
+        short_trend = "Bullish" if ma_7 > ma_25 else "Bearish"
+        mid_trend = "Bullish" if ma_50 > ma_99 else "Bearish"
+        long_trend = "Bullish" if ma_50 > ma_200 else "Bearish"
+
+        crypto_data = {
+            "symbol": symbol,
+            "pair": f"{symbol.upper().replace('USDT','').replace('-USD','')}/USDT",
+            "current_price_usd": round(float(current_price), 4),
+            "market_cap": info.get("marketCap", "N/A"),
+            "volume_24h": current_volume,
+            "avg_volume_30d": avg_volume_30d,
+            "volume_ratio": round(current_volume / avg_volume_30d, 2) if avg_volume_30d > 0 else "N/A",
+            "price_change_1d_pct": round(price_1d, 2),
+            "price_change_7d_pct": round(price_7d, 2) if price_7d else "N/A",
+            "price_change_30d_pct": round(price_30d, 2) if price_30d else "N/A",
+            "price_change_90d_pct": round(price_90d, 2) if price_90d else "N/A",
+            "rsi_14": round(current_rsi, 2) if current_rsi else "N/A",
+            "ma_7": round(ma_7, 4),
+            "ma_25": round(ma_25, 4),
+            "ma_50": round(ma_50, 4),
+            "ma_99": round(ma_99, 4),
+            "ma_200": round(ma_200, 4),
+            "bollinger_upper": round(bb_upper, 4),
+            "bollinger_lower": round(bb_lower, 4),
+            "macd": round(float(macd_line.iloc[-1]), 4),
+            "macd_signal": round(float(signal_line.iloc[-1]), 4),
+            "macd_histogram": round(float(macd_histogram.iloc[-1]), 4),
+            "volatility_30d_annualized_pct": round(volatility_30d, 2),
+            "short_term_trend": short_trend,
+            "mid_term_trend": mid_trend,
+            "long_term_trend": long_trend,
+            "ath_1y": round(ath, 4),
+            "atl_1y": round(atl, 4),
+            "pct_from_ath": round(pct_from_ath, 2),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        logger.info(f"Successfully fetched data for {symbol}: ${current_price:.2f}")
+        return crypto_data
+
+    except Exception as e:
+        logger.error(f"Error fetching data for {symbol}: {e}")
+        return {"symbol": symbol, "error": str(e)}
+
+
+def fetch_multi_crypto_data(symbols: List[str], workers: int = 5) -> Dict[str, Dict]:
+    """Fetch data for multiple crypto symbols concurrently."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fetch_crypto_data, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                results[sym] = future.result()
+            except Exception as e:
+                logger.error(f"Error processing {sym}: {e}")
+                results[sym] = {"symbol": sym, "error": str(e)}
+    return results
+
+
+def format_crypto_data(data: Dict) -> str:
+    """Format crypto data dict into a readable string for agents."""
+    if "error" in data:
+        return f"Error fetching data for {data.get('symbol', 'unknown')}: {data['error']}"
+
+    lines = [
+        f"{'='*50}",
+        f" {data['pair']} Market Data",
+        f"{'='*50}",
+        f"Price: ${data['current_price_usd']:,.4f}",
+        f"Market Cap: {data['market_cap']}",
+        f"",
+        f"-- Price Changes --",
+        f"  1D:  {data['price_change_1d_pct']}%",
+        f"  7D:  {data['price_change_7d_pct']}%",
+        f"  30D: {data['price_change_30d_pct']}%",
+        f"  90D: {data['price_change_90d_pct']}%",
+        f"",
+        f"-- Technical Indicators --",
+        f"  RSI(14): {data['rsi_14']}",
+        f"  MACD: {data['macd']} | Signal: {data['macd_signal']} | Hist: {data['macd_histogram']}",
+        f"  Bollinger Upper: ${data['bollinger_upper']:,.4f}",
+        f"  Bollinger Lower: ${data['bollinger_lower']:,.4f}",
+        f"",
+        f"-- Moving Averages --",
+        f"  MA(7):   ${data['ma_7']:,.4f}",
+        f"  MA(25):  ${data['ma_25']:,.4f}",
+        f"  MA(50):  ${data['ma_50']:,.4f}",
+        f"  MA(99):  ${data['ma_99']:,.4f}",
+        f"  MA(200): ${data['ma_200']:,.4f}",
+        f"",
+        f"-- Trend Analysis --",
+        f"  Short-term: {data['short_term_trend']}",
+        f"  Mid-term:   {data['mid_term_trend']}",
+        f"  Long-term:  {data['long_term_trend']}",
+        f"",
+        f"-- Volume & Volatility --",
+        f"  24h Volume:     {data['volume_24h']:,.0f}",
+        f"  30d Avg Volume: {data['avg_volume_30d']:,.0f}",
+        f"  Volume Ratio:   {data['volume_ratio']}x",
+        f"  30d Vol (Ann.): {data['volatility_30d_annualized_pct']}%",
+        f"",
+        f"-- Range (1Y) --",
+        f"  ATH: ${data['ath_1y']:,.4f}",
+        f"  ATL: ${data['atl_1y']:,.4f}",
+        f"  From ATH: {data['pct_from_ath']}%",
+    ]
+    return "\n".join(lines)
+
+
+# ── Agent Prompts ────────────────────────────────────────────────────────
+
+DIRECTOR_PROMPT = """You are a Crypto Trading Director AI, responsible for orchestrating the cryptocurrency trading process.
 
 Your primary objectives are:
-1. Conduct in-depth market analysis to identify opportunities and challenges.
-2. Develop comprehensive trading theses, encompassing both technical and fundamental aspects.
+1. Conduct in-depth crypto market analysis to identify opportunities and challenges.
+2. Develop comprehensive trading theses for cryptocurrency pairs (priced in USDT).
 3. Collaborate with specialized agents to ensure a cohesive strategy.
 4. Make informed, data-driven decisions on trade executions.
+5. Consider crypto-specific factors: on-chain metrics, sentiment, DeFi activity, regulatory news, whale movements, funding rates, and market dominance.
 
-For each stock under consideration, please provide the following:
+For each crypto asset under consideration, provide:
+- A concise market thesis outlining the overall position and expected trends
+- Key technical and on-chain factors influencing price
+- A detailed risk assessment highlighting crypto-specific risks (regulation, smart contract risk, liquidity, etc.)
+- Trade parameters: entry/exit points, position sizing, and risk management guidelines
+- Timeframe: scalp, swing, or position trade recommendation
+"""
 
-- A concise market thesis, outlining the overall market position and expected trends.
-- Key technical and fundamental factors influencing the stock's performance.
-- A detailed risk assessment, highlighting potential pitfalls and mitigation strategies.
-- Trade parameters, including entry and exit points, position sizing, and risk management guidelines.
+QUANT_PROMPT = """You are a Crypto Quantitative Analysis AI, providing in-depth numerical analysis for cryptocurrency trading decisions.
+
+Your primary objectives are:
+1. **Technical Indicator Analysis**: Evaluate RSI, MACD, Bollinger Bands, moving averages (7/25/50/99/200), volume profiles.
+2. **Statistical Pattern Evaluation**: Identify patterns including mean reversion, momentum, volatility cycles, and correlation with BTC dominance.
+3. **Risk Metric Calculation**: Calculate VaR, max drawdown, Sharpe ratio, and crypto-specific risk metrics.
+4. **Trade Success Probability**: Provide probability scores based on historical patterns and current technical setup.
+
+Include confidence scores (0-1) for each aspect. Output structured analysis including:
+- Technical score, volume score, trend strength, volatility assessment
+- Key support and resistance levels
+- Probability score for trade success
+- Recommended timeframe and direction
+"""
+
+RISK_PROMPT = """You are a Crypto Risk Assessment AI. Evaluate and mitigate risks for cryptocurrency trades.
+
+Your responsibilities include:
+1. **Position Sizing**: Determine optimal position size considering crypto's higher volatility (recommend % of portfolio).
+2. **Drawdown Analysis**: Calculate potential max drawdown based on historical volatility and current market conditions.
+3. **Crypto-Specific Risks**: Assess smart contract risk, regulatory risk, liquidity risk, counterparty risk.
+4. **Correlation Risk**: Evaluate correlation with BTC, overall market beta, and macro correlation.
+5. **Portfolio Impact**: Assess how this trade affects overall portfolio risk and diversification.
+
+Provide clear risk metrics:
+- Recommended position size (% of portfolio and USDT amount)
+- Maximum drawdown risk
+- Stop-loss levels
+- Risk/Reward ratio
+- Overall risk score (1-10, 10 being highest risk)
+"""
+
+EXECUTION_PROMPT = """You are a Crypto Trade Execution AI. Generate precise trade execution details for cryptocurrency pairs in USDT.
+
+Output a structured trade order including:
+- Trading pair (e.g., BTC/USDT)
+- Direction: LONG or SHORT
+- Order type (market/limit/stop-limit)
+- Entry price or price range
+- Position size in USDT and crypto amount
+- Stop loss (price and % from entry)
+- Take profit targets (TP1, TP2, TP3) with % allocation
+- Risk/Reward ratio
+- Leverage recommendation (if applicable)
+- Time in force
+- Special instructions (DCA, trailing stop, etc.)
 """
 
 
-# Quant Analysis Agent
-QUANT_PROMPT = """
-You are a Quantitative Analysis AI, tasked with providing in-depth numerical analysis to support trading decisions. Your primary objectives are:
-
-1. **Technical Indicator Analysis**: Evaluate various technical indicators such as moving averages, relative strength index (RSI), and Bollinger Bands to identify trends, patterns, and potential reversals.
-2. **Statistical Pattern Evaluation**: Apply statistical methods to identify patterns in historical data, including mean reversion, momentum, and volatility analysis.
-3. **Risk Metric Calculation**: Calculate risk metrics such as Value-at-Risk (VaR), Expected Shortfall (ES), and Greeks to quantify potential losses and position sensitivity.
-4. **Trade Success Probability**: Provide probability scores for trade success based on historical data analysis, technical indicators, and risk metrics.
-
-To accomplish these tasks, you will receive a trading thesis from the Director Agent, outlining the stock under consideration, market position, expected trends, and key factors influencing the stock's performance. Your analysis should build upon this thesis, providing detailed numerical insights to support or challenge the Director's hypothesis.
-
-In your analysis, include confidence scores for each aspect of your evaluation, indicating the level of certainty in your findings. This will enable the Director to make informed decisions, weighing the potential benefits against the risks associated with each trade.
-
-Your comprehensive analysis will be instrumental in refining the trading strategy, ensuring that it is grounded in empirical evidence and statistical rigor. By working together with the Director Agent, you will contribute to a cohesive and data-driven approach to trading, ultimately enhancing the overall performance of the trading system.
-"""
-
-SENTIMENT_PROMPT = """
-You are a Financial Sentiment Analysis AI specializing in evaluating market news and social sentiment for stocks and financial instruments.
-
-Your primary responsibilities include:
-
-1. **News Sentiment Analysis**: Analyze financial news articles, press releases, and earnings reports to determine sentiment polarity (positive, negative, neutral) and intensity.
-
-2. **Social Media Monitoring**: Evaluate social media discussions, including Reddit, Twitter, and StockTwits, to gauge retail investor sentiment and identify emerging trends.
-
-3. **Sentiment Metrics Calculation**: Provide quantitative sentiment scores (0-1 scale) with 0 being extremely negative and 1 being extremely positive.
-
-4. **Theme Identification**: Extract key themes and narratives driving sentiment, including product launches, regulatory concerns, competitive dynamics, and macroeconomic factors.
-
-5. **Sentiment Change Detection**: Identify significant shifts in sentiment that could signal changing market perception.
-
-6. **Contrarian Indicator Assessment**: Evaluate when extreme sentiment might represent a contrarian trading opportunity.
-
-For each analysis, you will receive:
-- Stock ticker symbol
-- Collection of recent news articles and social media posts
-- Timeframe for analysis
-
-Your output should include:
-
-1. **Overall Sentiment Score**: A numerical score between 0-1 representing the aggregate sentiment.
-
-2. **Sentiment Breakdown**:
-   - News Sentiment: Analysis of mainstream financial media
-   - Social Sentiment: Analysis of retail investor discussions
-   - Institutional Sentiment: Analysis of analyst reports and institutional commentary
-
-3. **Key Themes**: The primary narratives driving sentiment, both positive and negative.
-
-4. **Critical Events**: Identification of specific news events significantly impacting sentiment.
-
-5. **Sentiment Trend**: Whether sentiment is improving, deteriorating, or stable compared to previous periods.
-
-6. **Trading Implications**: How the current sentiment might impact short and medium-term price action.
-
-7. **Contrarian Signals**: Assessment of whether extreme sentiment readings might indicate potential market reversals.
-
-Your analysis should be data-driven, nuanced, and avoid simplistic conclusions. Recognize that sentiment is just one factor in market dynamics and should be considered alongside technical, fundamental, and macroeconomic factors.
-"""
-
-sentiment_agent = Agent(
-    agent_name="Sentiment-Agent",
-    system_prompt=SENTIMENT_PROMPT,
-    model_name="gpt-4o-mini",
-    output_type="str",
-    max_loops=1,
-    verbose=True,
-    context_length=16000,
-)
-
+# ── Pydantic Output Models ──────────────────────────────────────────────
 
 class AutoHedgeOutput(BaseModel):
     id: str = uuid.uuid4().hex
     thesis: Optional[str] = None
     risk_assessment: Optional[str] = None
     order: Optional[str] = None
-    decision: str = None
+    decision: Optional[str] = None
     timestamp: str = datetime.now().isoformat()
-    current_stock: str
+    current_asset: str
 
 
 class AutoHedgeOutputMain(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     id: str = uuid.uuid4().hex
-    stocks: Optional[list] = None
+    assets: Optional[list] = None
     task: Optional[str] = None
     timestamp: str = datetime.now().isoformat()
     logs: List[AutoHedgeOutput] = None
 
 
-# Risk Assessment Agent
-RISK_PROMPT = """You are a Risk Assessment AI. Your primary objective is to evaluate and mitigate potential risks associated with a given trade. 
+# ── Agent Classes ────────────────────────────────────────────────────────
 
-Your responsibilities include:
-
-1. Evaluating position sizing to determine the optimal amount of capital to allocate to a trade.
-2. Calculating potential drawdown to anticipate and prepare for potential losses.
-3. Assessing market risk factors, such as volatility, liquidity, and market sentiment.
-4. Monitoring correlation risks to identify potential relationships between different assets.
-
-To accomplish these tasks, you will be provided with a comprehensive thesis and analysis from the Quantitative Analysis Agent. 
-
-The thesis will include:
-- A clear direction (long or short) for the trade
-- A confidence level indicating the strength of the trade signal
-- An entry price and stop loss level to define the trade's parameters
-- A take profit level to determine the trade's potential upside
-- A timeframe for the trade, indicating the expected duration
-- Key factors influencing the trade, such as technical indicators or fundamental metrics
-- Potential risks associated with the trade, such as market volatility or economic uncertainty
-
-The analysis will include:
-- Technical scores indicating the strength of the trade signal based on technical indicators
-- Volume scores indicating the level of market participation and conviction
-- Trend strength scores indicating the direction and magnitude of the market trend
-- Key levels, such as support and resistance, to identify potential areas of interest
-
-Using this information, please provide clear risk metrics and trade size recommendations, including:
-- A recommended position size based on the trade's potential risk and reward
-- A maximum drawdown risk to anticipate and prepare for potential losses
-- A market risk exposure assessment to identify potential risks and opportunities
-- An overall risk score to summarize the trade's potential risks and rewards
-
-Your output should be in a structured format, including all relevant metrics and recommendations.
-"""
+def create_deepseek_agent(name: str, prompt: str) -> Agent:
+    """Create a Swarms Agent configured to use DeepSeek API."""
+    return Agent(
+        agent_name=name,
+        system_prompt=prompt,
+        model_name=AGENT_MODEL,
+        output_type="str",
+        max_loops=1,
+        verbose=True,
+        context_length=16000,
+    )
 
 
 class RiskManager:
     def __init__(self):
-        self.risk_agent = Agent(
-            agent_name="Risk-Manager",
-            system_prompt=RISK_PROMPT,
-            model_name="groq/deepseek-r1-distill-llama-70b",
-            output_type="str",
-            max_loops=1,
-            verbose=True,
-            context_length=16000,
-        )
+        self.risk_agent = create_deepseek_agent("Risk-Manager", RISK_PROMPT)
+        self.agent_name = "Risk-Manager"
 
-    def assess_risk(
-        self, stock: str, thesis: str, quant_analysis: str
-    ) -> str:
+    def assess_risk(self, asset: str, thesis: str, quant_analysis: str) -> str:
         prompt = f"""
-        Stock: {stock}
-        Thesis: {thesis}
-        Quant Analysis: {quant_analysis}
+        Crypto Asset: {asset}
+        Trading Thesis: {thesis}
+        Quantitative Analysis: {quant_analysis}
         
-        Provide risk assessment including:
-        1. Recommended position size
+        Provide comprehensive risk assessment including:
+        1. Recommended position size (% of portfolio and USDT amount)
         2. Maximum drawdown risk
-        3. Market risk exposure
-        4. Overall risk score
+        3. Stop-loss levels
+        4. Risk/Reward ratio
+        5. Crypto-specific risk factors
+        6. Overall risk score (1-10)
         """
-        assessment = self.risk_agent.run(prompt)
-
-        return assessment
-
-
-# Execution Agent
-EXECUTION_PROMPT = """You are a Trade Execution AI. Your primary objective is to execute trades with precision and accuracy. Your key responsibilities include:
-
-1. **Generating structured order parameters**: Define the essential details of the trade, including the stock symbol, quantity, and price.
-2. **Setting precise entry/exit levels**: Determine the exact points at which to enter and exit the trade, ensuring optimal profit potential and risk management.
-3. **Determining order types**: Choose the most suitable order type for the trade, such as market order, limit order, or stop-loss order, based on market conditions and trade strategy.
-4. **Specifying time constraints**: Define the timeframe for the trade, including the start and end dates, to ensure timely execution and minimize exposure to market volatility.
-
-To execute trades effectively, provide exact trade execution details in a structured format, including:
-
-* Stock symbol and quantity
-* Entry and exit prices
-* Order type (market, limit, stop-loss, etc.)
-* Time constraints (start and end dates, time in force)
-* Any additional instructions or special requirements
-
-By following these guidelines, you will ensure that trades are executed efficiently, minimizing potential losses and maximizing profit opportunities.
-"""
+        return self.risk_agent.run(prompt)
 
 
 class ExecutionAgent:
     def __init__(self):
-        self.execution_agent = Agent(
-            agent_name="Execution-Agent",
-            system_prompt=EXECUTION_PROMPT,
-            model_name="groq/deepseek-r1-distill-llama-70b",
-            output_type="str",
-            max_loops=1,
-            verbose=True,
-            context_length=16000,
-        )
+        self.execution_agent = create_deepseek_agent("Execution-Agent", EXECUTION_PROMPT)
+        self.agent_name = "Execution-Agent"
 
-    def generate_order(
-        self, stock: str, thesis: Dict, risk_assessment: Dict
-    ) -> str:
+    def generate_order(self, asset: str, thesis: str, risk_assessment: str) -> str:
         prompt = f"""
-        Stock: {stock}
-        Thesis: {thesis}
+        Crypto Asset: {asset}
+        Trading Thesis: {thesis}
         Risk Assessment: {risk_assessment}
         
-        Generate trade order including:
-        1. Order type (market/limit)
-        2. Quantity
-        3. Entry price
-        4. Stop loss
-        5. Take profit
-        6. Time in force
+        Generate a detailed trade order for {asset}/USDT including:
+        1. Direction (LONG/SHORT)
+        2. Order type (market/limit/stop-limit)
+        3. Entry price or range
+        4. Position size in USDT
+        5. Stop loss (price and %)
+        6. Take profit targets (TP1, TP2, TP3)
+        7. Risk/Reward ratio
+        8. Leverage recommendation
+        9. Time in force
+        10. DCA strategy if applicable
         """
-        order = self.execution_agent.run(prompt)
-        return order
-
-
-class TradingDirector:
-    """
-    Trading Director Agent responsible for generating trading theses and coordinating strategy.
-
-    Attributes:
-        director_agent (Agent): Swarms agent for thesis generation
-        tickr (TickrAgent): Agent for market data collection
-        output_dir (Path): Directory for storing outputs
-
-    Methods:
-        generate_thesis: Generates trading thesis for a given stock
-        save_output: Saves thesis to JSON file
-    """
-
-    def __init__(
-        self,
-        stocks: List[str],
-        output_dir: str = "outputs",
-        cryptos: List[str] = None,
-    ):
-
-        logger.info("Initializing Trading Director")
-        self.director_agent = Agent(
-            agent_name="Trading-Director",
-            system_prompt=DIRECTOR_PROMPT,
-            model_name="groq/deepseek-r1-distill-llama-70b",
-            output_type="str",
-            max_loops=1,
-            verbose=True,
-            context_length=16000,
-        )
-
-        # self.crypto_agent = CryptoAgentWrapper()
-
-    def generate_thesis(
-        self,
-        task: str = "Generate a thesis for the stock",
-        stock: str = None,
-        crypto: str = None,
-    ) -> str:
-        """
-        Generate trading thesis for a given stock.
-
-        Args:
-            stock (str): Stock ticker symbol
-
-        Returns:
-            TradingThesis: Generated thesis
-        """
-        logger.info(f"Generating thesis for {stock}")
-
-        self.tickr = TickrAgent(
-            stocks=[stock],
-            max_loops=1,
-            workers=10,
-            retry_attempts=1,
-            context_length=16000,
-        )
-
-        try:
-            market_data = self.tickr.run(
-                f"{task} Analyze current market conditions and key metrics for {stock}"
-            )
-
-            prompt = f"""
-            Task: {task}
-            \n
-            Stock: {stock}
-            Market Data: {market_data}
-            """
-
-            thesis = self.director_agent.run(prompt)
-            return thesis, market_data
-
-        except Exception as e:
-            logger.error(
-                f"Error generating thesis for {stock}: {str(e)}"
-            )
-            raise
-
-    def make_decision(self, task: str, thesis: str, *args, **kwargs):
-        return self.director_agent.run(
-            f"According to the thesis, {thesis}, should we execute this order: {task}"
-        )
-
-    def generate_thesis_crypto(
-        self,
-        task: str = None,
-        crypto: str = None,
-    ):
-        logger.info(f"Generating thesis for {crypto}")
-        try:
-            market_data = self.crypto_agent.run(
-                crypto,
-                f"{task} Analyze current market conditions and key metrics for {crypto}",
-            )
-
-            prompt = f"""
-            Task: {task}
-            \n
-            Stock: {crypto}
-            Market Data: {market_data}
-            """
-
-            thesis = self.director_agent.run(prompt)
-            return thesis
-
-        except Exception as e:
-            logger.error(
-                f"Error generating thesis for {crypto}: {str(e)}"
-            )
-            raise
+        return self.execution_agent.run(prompt)
 
 
 class QuantAnalyst:
-    """
-    Quantitative Analysis Agent responsible for technical and statistical analysis.
-
-    Attributes:
-        quant_agent (Agent): Swarms agent for analysis
-        output_dir (Path): Directory for storing outputs
-    """
+    """Quantitative Analysis Agent for crypto markets."""
 
     def __init__(self, output_dir: str = "outputs"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.quant_agent = create_deepseek_agent("Quant-Analyst", QUANT_PROMPT)
+        self.agent_name = "Quant-Analyst"
+        logger.info("Initialized Crypto Quant Analyst (DeepSeek)")
 
-        logger.info("Initializing Quant Analyst")
-        self.quant_agent = Agent(
-            agent_name="Quant-Analyst",
-            system_prompt=QUANT_PROMPT,
-            model_name="groq/deepseek-r1-distill-llama-70b",
-            output_type="str",
-            max_loops=1,
-            verbose=True,
-            context_length=16000,
+    def analyze(self, asset: str, market_data: str, thesis: str) -> str:
+        logger.info(f"Performing quant analysis for {asset}")
+        prompt = f"""
+        Crypto Asset: {asset}
+        Market Data:
+        {market_data}
+        
+        Director's Thesis: {thesis}
+        
+        Generate comprehensive quantitative analysis including:
+        - Technical score (0-1)
+        - Volume score (0-1) 
+        - Trend strength (0-1)
+        - Volatility assessment
+        - Probability score for trade success (0-1)
+        - Key support and resistance levels in USDT
+        - MACD / RSI / Bollinger Band interpretation
+        - Recommended direction and timeframe
+        """
+        return self.quant_agent.run(prompt)
+
+
+class TradingDirector:
+    """Trading Director Agent for crypto markets."""
+
+    def __init__(self, assets: List[str], output_dir: str = "outputs"):
+        logger.info("Initializing Crypto Trading Director (DeepSeek)")
+        self.director_agent = create_deepseek_agent("Trading-Director", DIRECTOR_PROMPT)
+        self.agent_name = "Trading-Director"
+
+    def generate_thesis(self, task: str, asset: str) -> tuple:
+        """Generate trading thesis for a crypto asset with live market data."""
+        logger.info(f"Generating thesis for {asset}")
+
+        # Fetch live market data
+        market_data_raw = fetch_crypto_data(asset)
+        market_data_str = format_crypto_data(market_data_raw)
+
+        prompt = f"""
+        Task: {task}
+        
+        Crypto Asset: {asset}/USDT
+        
+        Live Market Data:
+        {market_data_str}
+        
+        Generate a comprehensive trading thesis for {asset}/USDT based on the above data.
+        Include your conviction level, recommended direction, timeframe, and key catalysts.
+        """
+
+        thesis = self.director_agent.run(prompt)
+        return thesis, market_data_str
+
+    def make_decision(self, order_details: str, thesis: str) -> str:
+        return self.director_agent.run(
+            f"Based on the thesis: {thesis}\n\n"
+            f"And the proposed order + risk assessment:\n{order_details}\n\n"
+            f"Should we execute this trade? Provide a clear GO / NO-GO decision with reasoning."
         )
-
-    def analyze(self, stock: str, thesis: str) -> str:
-        """
-        Perform quantitative analysis for a stock.
-
-        Args:
-            stock (str): Stock ticker symbol
-            thesis (TradingThesis): Trading thesis
-
-        Returns:
-            QuantAnalysis: Quantitative analysis results
-        """
-        logger.info(f"Performing quant analysis for {stock}")
-        try:
-            prompt = f"""
-            Stock: {stock}
-            Thesis from your Director: {thesis}
-            
-            Generate quantitative analysis for the {stock}
-            
-            "ticker": str,
-            "technical_score": float (0-1),
-            "volume_score": float (0-1),
-            "trend_strength": float (0-1),
-            "volatility": float,
-            "probability_score": float (0-1),
-            "key_levels": {{
-                "support": float,
-                "resistance": float,
-                "pivot": float
-            }}
-            """
-
-            analysis = self.quant_agent.run(prompt)
-            return analysis
-
-        except Exception as e:
-            logger.error(
-                f"Error in quant analysis for {stock}: {str(e)}"
-            )
-            raise
 
 
 class AutoHedge:
     """
-    Main trading system that coordinates all agents and manages the trading cycle.
-
-    Attributes:
-        stocks (List[str]): List of stock tickers to trade
-        director (TradingDirector): Trading director agent
-        quant (QuantAnalyst): Quantitative analysis agent
-        risk (RiskManager): Risk management agent
-        execution (ExecutionAgent): Trade execution agent
-        output_dir (Path): Directory for storing outputs
+    Main crypto trading system that coordinates all agents.
+    Analyzes cryptocurrency pairs against USDT using DeepSeek AI.
     """
 
     def __init__(
         self,
-        stocks: List[str],
-        name: str = "autohedge",
-        description: str = "fully autonomous hedgefund",
+        assets: List[str] = None,
+        stocks: List[str] = None,  # backward compat alias
+        name: str = "autohedge-crypto",
+        description: str = "AI-powered crypto analysis system",
         output_dir: str = "outputs",
-        output_file_path: str = None,
-        strategy: str = None,
-        output_type: str = "list",
+        output_type: str = "str",
+        **kwargs,
     ):
-        """
-        Initialize the AutoHedge class.
-
-        Args:
-            stocks (List[str]): List of stock tickers to trade
-            name (str, optional): Name of the trading system. Defaults to "autohedge".
-            description (str, optional): Description of the trading system. Defaults to "fully autonomous hedgefund".
-            output_dir (str, optional): Directory for storing outputs. Defaults to "outputs".
-            output_file_path (str, optional): Path to the output file. Defaults to None.
-        """
+        # Support both 'assets' and 'stocks' parameter names
+        self.assets = assets or stocks or []
         self.name = name
         self.description = description
-        self.stocks = stocks
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        self.strategy = strategy
         self.output_type = output_type
-        self.output_file_path = output_file_path
-        logger.info("Initializing Automated Trading System")
-        self.director = TradingDirector(stocks, output_dir)
-        self.quant = QuantAnalyst()
+
+        logger.info(f"Initializing AutoHedge Crypto System")
+        logger.info(f"Assets: {self.assets}")
+        logger.info(f"Model: DeepSeek ({DEEPSEEK_MODEL})")
+
+        self.director = TradingDirector(self.assets, output_dir)
+        self.quant = QuantAnalyst(output_dir)
         self.risk = RiskManager()
         self.execution = ExecutionAgent()
-        self.logs = AutoHedgeOutputMain(
-            name=self.name,
-            description=self.description,
-            stocks=stocks,
-            task="",
-            logs=[],
-        )
         self.conversation = Conversation(time_enabled=True)
 
     def run(self, task: str, *args, **kwargs):
-        """
-        Execute one complete trading cycle for all stocks.
-
-        Args:
-            task (str): The task to be executed.
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
-
-        Returns:
-            List: List of logs for each stock.
-        """
-        logger.info("Starting trading cycle")
+        """Execute a complete analysis cycle for all crypto assets."""
+        logger.info("Starting crypto analysis cycle")
         self.conversation.add(role="user", content=f"Task: {task}")
 
         try:
-            for stock in self.stocks:
-                logger.info(f"Processing {stock}")
+            for asset in self.assets:
+                logger.info(f"{'='*50}")
+                logger.info(f" Processing {asset}/USDT")
+                logger.info(f"{'='*50}")
 
-                # Generate thesis
+                # Step 1: Generate thesis with live market data
+                logger.info(f"[1/5] Generating thesis for {asset}...")
                 thesis, market_data = self.director.generate_thesis(
-                    task=task, stock=stock
+                    task=task, asset=asset
                 )
-
-                self.conversation.add_message(
-                    role=self.director.agent_name,
-                    content=f"Stock: {stock}\nMarket Data: {market_data}\nThesis: {thesis}",
-                )
-
-                # Perform analysis
-                analysis = self.quant.analyze(
-                    stock + market_data, thesis
-                )
-
-                # setiment_analysis = sentiment_agent.run(
-                #     fetch_stock_news(stock)
-                # )
-
-                # logger.info(f"Sentiment Analysis: {setiment_analysis}")
-
-                # self.conversation.add(sentiment_agent.agent_name, setiment_analysis)
-
                 self.conversation.add(
-                    role=self.quant.agent_name, content=analysis
+                    role="Trading-Director",
+                    content=f"Asset: {asset}/USDT\n\nMarket Data:\n{market_data}\n\nThesis:\n{thesis}",
                 )
 
-                # Assess risk
-                risk_assessment = self.risk.assess_risk(
-                    stock + market_data, thesis, analysis
-                )
+                # Step 2: Quantitative analysis
+                logger.info(f"[2/5] Running quant analysis for {asset}...")
+                analysis = self.quant.analyze(asset, market_data, thesis)
+                self.conversation.add(role="Quant-Analyst", content=analysis)
 
-                self.conversation.add(
-                    role=self.risk.agent_name, content=risk_assessment
-                )
+                # Step 3: Risk assessment
+                logger.info(f"[3/5] Assessing risk for {asset}...")
+                risk_assessment = self.risk.assess_risk(asset, thesis, analysis)
+                self.conversation.add(role="Risk-Manager", content=risk_assessment)
 
-                # # Generate order if approved
-                order = self.execution.generate_order(
-                    stock, thesis, risk_assessment
-                )
+                # Step 4: Generate execution order
+                logger.info(f"[4/5] Generating trade order for {asset}...")
+                order = self.execution.generate_order(asset, thesis, risk_assessment)
+                self.conversation.add(role="Execution-Agent", content=order)
 
-                self.conversation.add(
-                    role=self.execution.agent_name, content=order
-                )
-
-                order = str(order)
-
-                # Final decision
+                # Step 5: Final decision
+                logger.info(f"[5/5] Making final decision for {asset}...")
                 decision = self.director.make_decision(
-                    order + market_data + risk_assessment, thesis
+                    f"{order}\n\nRisk Assessment:\n{risk_assessment}\n\nMarket Data:\n{market_data}",
+                    thesis,
                 )
-
                 self.conversation.add(
-                    role=self.director.agent_name, content=decision
+                    role="Trading-Director",
+                    content=f"DECISION for {asset}/USDT:\n{decision}",
                 )
 
-            #     log = AutoHedgeOutput(
-            #         thesis=thesis,
-            #         risk_assessment=risk_assessment,
-            #         current_stock=stock,
-            #         order=order,
-            #         decision=decision,
-            #     )
+                logger.info(f"Completed analysis for {asset}/USDT")
 
-            #     # logs.append(log.model_dump_json(indent=4))
-            #     self.logs.task = task
-            #     self.logs.logs.append(log)
+            logger.info("All assets analyzed")
 
-            # create_file_in_folder(
-            #     self.output_dir,
-            #     f"analysis-{uuid.uuid4().hex}.json",
-            #     self.logs.model_dump_json(indent=4),
-            # )
-
-            # return self.logs.model_dump_json(indent=4)
             if self.output_type == "list":
                 return self.conversation.return_messages_as_list()
             elif self.output_type == "dict":
-                return (
-                    self.conversation.return_messages_as_dictionary()
-                )
+                return self.conversation.return_messages_as_dictionary()
             elif self.output_type == "str":
+                return self.conversation.return_history_as_string()
+            else:
                 return self.conversation.return_history_as_string()
 
         except Exception as e:

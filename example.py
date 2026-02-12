@@ -4,18 +4,24 @@ from autohedge.main import AutoHedge
 load_dotenv()
 
 
-# Define the stocks to analyze
-stocks = ["NVDA", "TSLA", "MSFT", "GOOG"]
+# Define the crypto assets to analyze (in USDT pairs)
+cryptos = ["BTC", "SOL", "ETH"]
 
-# Initialize the trading system with the specified stocks
+# Initialize the trading system
 trading_system = AutoHedge(
-    name="swarms-fund",
-    description="Private Hedge Fund for Swarms Corp",
-    stocks=stocks,
+    name="crypto-fund",
+    description="AI-Powered Crypto Analysis Fund (DeepSeek)",
+    assets=cryptos,
+    output_type="str",  # "str", "list", or "dict"
 )
 
-# Define the task for the trading cycle
-task = "As BlackRock, let's evaluate AI companies for a portfolio with $500 million in allocation, aiming for a balanced risk-reward profile."
+# Define the analysis task
+task = (
+    "Analyze BTC/USDT, SOL/USDT, and ETH/USDT for a portfolio with $50,000 USDT allocation. "
+    "Provide trading recommendations with entry/exit points, position sizing, "
+    "and risk management for each asset. Consider current market conditions, "
+    "technical indicators, and crypto-specific risks."
+)
 
-# Run the trading cycle and print the results
+# Run the analysis and print results
 print(trading_system.run(task=task))
